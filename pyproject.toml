@@ -1,0 +1,15 @@
+[project]
+name = "qwen-grpo"
+version = "0.1.0"
+description = "A small from-scratch GRPO trainer for Qwen/Qwen3-0.6B."
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate>=0.33.0",
+  "datasets>=2.20.0",
+  "torch>=2.3.0",
+  "transformers>=4.51.0",
+]
+
+[tool.ruff]
+line-length = 100
+

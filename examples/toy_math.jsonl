@@ -1,0 +1,6 @@
+{"prompt":"What is 2 + 3? Return only the final number.","answer":"5"}
+{"prompt":"What is 12 * 7? Return only the final number.","answer":"84"}
+{"prompt":"What is 100 - 37? Return only the final number.","answer":"63"}
+{"prompt":"What is 9 squared? Return only the final number.","answer":"81"}
+{"prompt":"What is 144 / 12? Return only the final number.","answer":"12"}
+
