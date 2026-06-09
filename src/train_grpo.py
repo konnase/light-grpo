@@ -52,6 +52,7 @@ class JsonlPromptDataset(Dataset[Sample]):
 
 
 def collate(samples: list[Sample]) -> dict[str, list[str | None]]:
+    """将 Sample 列表转换为包含 prompts 和 answers 的批次字典。"""
     return {
         "prompts": [s.prompt for s in samples],
         "answers": [s.answer for s in samples],
@@ -59,6 +60,7 @@ def collate(samples: list[Sample]) -> dict[str, list[str | None]]:
 
 
 def last_number(text: str) -> str | None:
+    """从文本中提取最后一个数字字符串，忽略千位分隔符逗号。"""
     matches = re.findall(r"[-+]?(?:\d*\.\d+|\d+)", text.replace(",", ""))
     if not matches:
         return None
@@ -66,6 +68,7 @@ def last_number(text: str) -> str | None:
 
 
 def reward_exact_match(completions: list[str], answers: list[str | None]) -> torch.Tensor:
+    """计算每条补全的奖励：数值精确匹配得 1.0，字符串包含匹配得 1.0，否则 0.0。"""
     rewards: list[float] = []
     for completion, answer in zip(completions, answers, strict=True):
         if answer is None:
@@ -85,6 +88,7 @@ def reward_exact_match(completions: list[str], answers: list[str | None]) -> tor
 
 
 def format_prompt(tokenizer: AutoTokenizer, prompt: str) -> str:
+    """将 prompt 格式化为模型输入，有 chat_template 时应用模板，否则原样返回。"""
     messages = [{"role": "user", "content": prompt}]
     if getattr(tokenizer, "chat_template", None):
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -92,6 +96,7 @@ def format_prompt(tokenizer: AutoTokenizer, prompt: str) -> str:
 
 
 def repeat_by_group(values: Iterable[str | None], group_size: int) -> list[str | None]:
+    """将序列中每个元素重复 group_size 次，用于将答案与多组采样对齐。"""
     repeated: list[str | None] = []
     for value in values:
         repeated.extend([value] * group_size)
@@ -99,6 +104,7 @@ def repeat_by_group(values: Iterable[str | None], group_size: int) -> list[str |
 
 
 def setup_logging() -> None:
+    """初始化结构化日志，输出到 stdout，格式含时间戳和级别。"""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
@@ -108,11 +114,13 @@ def setup_logging() -> None:
 
 
 def log_event(event: str, **fields: object) -> None:
+    """以 JSON 格式记录一条带有 event 字段的结构化日志。"""
     payload = {"event": event, **fields}
     logger.info(json.dumps(payload, ensure_ascii=False, default=str))
 
 
 def selective_log_softmax(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    """对 logits 做 log_softmax 后，仅取 input_ids 对应位置的对数概率。"""
     log_probs = F.log_softmax(logits, dim=-1)
     return log_probs.gather(dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
 
@@ -122,15 +130,41 @@ def get_token_logprobs(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
+    """前向传播并返回每个 next-token 位置的对数概率，形状 (batch, seq_len-1)。"""
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     # logits[:, t] predicts input_ids[:, t + 1]
     return selective_log_softmax(outputs.logits[:, :-1, :], input_ids[:, 1:])
+
+
+def build_attention_mask(
+    generated: torch.Tensor,
+    prompt_sequence_length: int,
+    pad_token_id: int,
+    eos_token_id: int,
+) -> torch.Tensor:
+    """构建生成序列的 attention mask，正确处理 pad_token_id == eos_token_id 的情况。
+
+    当两者相同时，token-id 方式会把合法的 stop-EOS 也屏蔽掉，导致 EOS 动作无梯度信号。
+    此函数找到每行补全部分第一个 EOS 的位置，保留该位置为 attended，之后置 0。
+    """
+    if pad_token_id != eos_token_id:
+        return generated.ne(pad_token_id).long()
+
+    mask = torch.ones(generated.shape, dtype=torch.long, device=generated.device)
+    for i in range(generated.shape[0]):
+        completion = generated[i, prompt_sequence_length:]
+        eos_pos = (completion == eos_token_id).nonzero(as_tuple=False)
+        if eos_pos.numel() > 0:
+            first_eos = int(eos_pos[0, 0])
+            mask[i, prompt_sequence_length + first_eos + 1 :] = 0
+    return mask
 
 
 def make_completion_mask(
     attention_mask: torch.Tensor,
     prompt_sequence_lengths: torch.Tensor,
 ) -> torch.Tensor:
+    """生成布尔掩码，标记 next-token logprob 序列中属于补全部分的有效位置。"""
     # Mask is aligned with next-token logprobs, so position j corresponds to input_ids[:, j + 1].
     batch, seq_len_minus_1 = attention_mask[:, 1:].shape
     positions = torch.arange(seq_len_minus_1, device=attention_mask.device).unsqueeze(0).expand(batch, -1)
@@ -139,6 +173,7 @@ def make_completion_mask(
 
 
 def grpo_advantages(rewards: torch.Tensor, group_size: int, eps: float = 1e-4) -> torch.Tensor:
+    """对每组奖励做组内 z-score 归一化，返回扁平化的优势值张量。"""
     grouped = rewards.view(-1, group_size)
     mean = grouped.mean(dim=1, keepdim=True)
     std = grouped.std(dim=1, keepdim=True, unbiased=False)
@@ -156,6 +191,7 @@ def grpo_loss(
     clip_eps: float,
     beta: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    """计算 GRPO 损失：clipped policy objective 减去 KL 惩罚项，返回损失及诊断指标。"""
     logprobs = get_token_logprobs(model, input_ids, attention_mask)
     with torch.no_grad():
         ref_logprobs = get_token_logprobs(ref_model, input_ids, attention_mask)
@@ -197,6 +233,7 @@ def sample_groups(
     top_p: float,
     device: torch.device,
 ) -> dict[str, torch.Tensor | list[str]]:
+    """为每条 prompt 采样 group_size 条补全，计算奖励、优势及旧对数概率，返回完整 rollout 字典。"""
     formatted_prompts = [format_prompt(tokenizer, prompt) for prompt in prompts]
     encoded = tokenizer(
         formatted_prompts,
@@ -207,16 +244,25 @@ def sample_groups(
     ).to(device)
     prompt_sequence_length = encoded["input_ids"].shape[1]
 
-    generated = model.generate(
-        **encoded,
-        do_sample=True,
-        temperature=temperature,
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
-        num_return_sequences=group_size,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    # Bug 2 fix: eval mode during rollout so dropout is disabled
+    # Bug 4 fix: re-enable KV cache for O(N) generation, restore afterward
+    model.eval()
+    use_cache_orig = model.config.use_cache
+    model.config.use_cache = True
+    try:
+        generated = model.generate(
+            **encoded,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            max_new_tokens=max_new_tokens,
+            num_return_sequences=group_size,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    finally:
+        model.config.use_cache = use_cache_orig
+        model.train()
 
     repeated_prompt_lengths = torch.full(
         (generated.shape[0],),
@@ -224,7 +270,10 @@ def sample_groups(
         dtype=torch.long,
         device=device,
     )
-    repeated_attention = generated.ne(tokenizer.pad_token_id).long()
+    # Bug 1 fix: use position-based mask so EOS is not wrongly zeroed when pad_id == eos_id
+    repeated_attention = build_attention_mask(
+        generated, prompt_sequence_length, tokenizer.pad_token_id, tokenizer.eos_token_id
+    )
     completion_mask = make_completion_mask(repeated_attention, repeated_prompt_lengths)
 
     completions: list[str] = []
@@ -235,7 +284,12 @@ def sample_groups(
     repeated_answers = repeat_by_group(answers, group_size)
     rewards = reward_exact_match(completions, repeated_answers).to(device)
     advantages = grpo_advantages(rewards, group_size).to(device)
-    old_logprobs = get_token_logprobs(model, generated, repeated_attention).detach()
+    # old_logprobs must be computed in eval mode with same dropout=0 as generation
+    model.eval()
+    try:
+        old_logprobs = get_token_logprobs(model, generated, repeated_attention).detach()
+    finally:
+        model.train()
 
     return {
         "input_ids": generated,
@@ -249,6 +303,7 @@ def sample_groups(
 
 
 def parse_args() -> argparse.Namespace:
+    """解析命令行参数，涵盖模型、数据集、训练超参数及采样配置。"""
     parser = argparse.ArgumentParser(description="Train Qwen/Qwen3-0.6B with a minimal GRPO loop.")
     parser.add_argument("--dataset", required=True, help="Path to JSONL data with prompt and optional answer fields.")
     parser.add_argument("--model_name", default="Qwen/Qwen3-0.6B")
@@ -271,10 +326,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bf16", action="store_true", help="Load models in bfloat16 when supported.")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--num_ppo_epochs", type=int, default=1,
+                        help="Inner PPO epochs per rollout. >1 lets the clipped surrogate take effect.")
     return parser.parse_args()
 
 
 def main() -> None:
+    """训练入口：加载模型与数据集，执行 GRPO 训练循环，定期保存检查点。"""
     setup_logging()
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -402,36 +460,31 @@ def main() -> None:
         )
 
         loss_start = time.perf_counter()
-        loss, metrics = grpo_loss(
-            model=model,
-            ref_model=ref_model,
-            input_ids=rollout["input_ids"],
-            attention_mask=rollout["attention_mask"],
-            completion_mask=rollout["completion_mask"],
-            old_logprobs=rollout["old_logprobs"],
-            advantages=rollout["advantages"],
-            clip_eps=args.clip_eps,
-            beta=args.beta,
-        )
-        log_event(
-            "step_loss_done",
-            step=step,
-            loss_seconds=round(time.perf_counter() - loss_start, 4),
-            **metrics,
-        )
-
-        optim_start = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        for ppo_epoch in range(args.num_ppo_epochs):
+            loss, metrics = grpo_loss(
+                model=model,
+                ref_model=ref_model,
+                input_ids=rollout["input_ids"],
+                attention_mask=rollout["attention_mask"],
+                completion_mask=rollout["completion_mask"],
+                old_logprobs=rollout["old_logprobs"],
+                advantages=rollout["advantages"],
+                clip_eps=args.clip_eps,
+                beta=args.beta,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        # Step LR scheduler once per rollout, not per inner PPO epoch
         scheduler.step()
         log_event(
-            "step_optim_done",
+            "step_loss_optim_done",
             step=step,
-            optim_seconds=round(time.perf_counter() - optim_start, 4),
+            elapsed_seconds=round(time.perf_counter() - loss_start, 4),
             grad_norm=float(grad_norm.detach().cpu()),
             lr=scheduler.get_last_lr()[0],
+            **metrics,
         )
 
         if step % args.log_every == 0:
