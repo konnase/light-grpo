@@ -13,3 +13,4 @@ outputs/
 wandb/
 runs/
 checkpoints/
+.omc
