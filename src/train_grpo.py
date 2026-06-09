@@ -1,3 +1,85 @@
+"""
+GRPO (Group Relative Policy Optimization) 训练脚本
+====================================================
+
+## 算法原理
+
+GRPO 是专为语言模型 RLHF 设计的强化学习算法，在 PPO 基础上用组内相对奖励替代 Critic 网络，
+大幅降低显存消耗，同时保留 PPO 的 clipped surrogate 稳定性。
+
+### 工作流程
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  for each training step:                                        │
+    │                                                                 │
+    │  1. Rollout   对每条 prompt 用 π_θ 采样 G 条补全               │
+    │  2. Reward    对每条补全打分得 r_1 … r_G                        │
+    │  3. Advantage 组内 z-score 归一化，得优势 A_1 … A_G            │
+    │  4. Update    num_ppo_epochs 轮：最大化 GRPO 目标，梯度更新 θ   │
+    └─────────────────────────────────────────────────────────────────┘
+
+### 核心公式
+
+**Step 3 — 组内优势归一化（替代 Critic）：**
+
+    A_i = (r_i − mean(r_{1..G})) / (std(r_{1..G}) + ε)
+
+**Step 4a — 概率比率：**
+
+    ρ_t = π_θ(a_t | s_t) / π_θ_old(a_t | s_t)
+        = exp( log π_θ(a_t|s_t) − log π_θ_old(a_t|s_t) )
+
+**Step 4b — Clipped Surrogate Objective（PPO-Clip）：**
+
+    L_clip(t) = min( ρ_t · A_i,   clip(ρ_t, 1−ε, 1+ε) · A_i )
+
+    ε（clip_eps）限制单步更新幅度：当 ratio 超出 [1−ε, 1+ε] 时梯度被截断，
+    防止策略单步跳变过大。
+
+**Step 4c — KL 散度惩罚（K3 近似，恒非负）：**
+
+    KL_approx(t) = exp(Δ_t) − Δ_t − 1,   Δ_t = log π_ref(a_t|s_t) − log π_θ(a_t|s_t)
+
+    在 Δ=0 处退化为 0，是真实 KL(π_θ ‖ π_ref) 的下界近似，
+    β（beta）控制其对策略偏离参考模型的惩罚力度。
+
+**Step 4d — 最终每 token 损失（最小化）：**
+
+    L = − (1 / |completion_tokens|) · Σ_t [ L_clip(t) − β · KL_approx(t) ]
+
+---
+
+## 脚本功能
+
+对 CausalLM（默认 Qwen/Qwen3-0.6B）做 GRPO 强化微调，奖励信号来自对答案的精确匹配：
+数值近似相等得 1.0，字符串包含匹配得 1.0，否则 0.0。
+
+数据集为 JSONL 格式，每行须包含 `prompt` 字段，`answer` 字段可选（缺失时奖励恒为 0）。
+
+---
+
+## 使用方式
+
+    python src/train_grpo.py \\
+        --dataset        path/to/data.jsonl   \\
+        --model_name     Qwen/Qwen3-0.6B      \\
+        --output_dir     outputs/my-model     \\
+        --num_steps      100                  \\
+        --group_size     4                    \\  # G：每条 prompt 采样几条补全
+        --per_device_prompts 2               \\  # 每步处理几条 prompt
+        --max_prompt_length  256             \\
+        --max_new_tokens     128             \\
+        --num_ppo_epochs     1               \\  # >1 时 clip 真正生效（完整 GRPO）
+        --clip_eps       0.2                 \\  # ε
+        --beta           0.04                \\  # β
+        --bf16                                   # GPU 上启用 bfloat16
+
+关键参数说明：
+  --group_size G        G 越大优势估计越稳定，显存/时间随 G 线性增加
+  --num_ppo_epochs N    默认 1（等价于 REINFORCE+KL）；设 N>1 可重复利用 rollout
+  --clip_eps ε          PPO-Clip 幅度，典型值 0.1~0.2
+  --beta β              KL 惩罚系数，典型值 0.01~0.1；设 0 退化为纯 policy gradient
+"""
 from __future__ import annotations
 
 import argparse
@@ -174,6 +256,10 @@ def make_completion_mask(
 
 def grpo_advantages(rewards: torch.Tensor, group_size: int, eps: float = 1e-4) -> torch.Tensor:
     """对每组奖励做组内 z-score 归一化，返回扁平化的优势值张量。"""
+    # rewards shape: (batch * G,)，将其重排为 (batch, G) 做组内统计
+    # 公式：A_i = (r_i − mean(r_{1..G})) / (std(r_{1..G}) + ε)
+    # 组内均值消除奖励绝对量级，除以标准差使优势量级稳定；
+    # 若一组内所有奖励相同（std=0），A_i 全为 0，该步不产生策略梯度信号。
     grouped = rewards.view(-1, group_size)
     mean = grouped.mean(dim=1, keepdim=True)
     std = grouped.std(dim=1, keepdim=True, unbiased=False)
@@ -196,16 +282,27 @@ def grpo_loss(
     with torch.no_grad():
         ref_logprobs = get_token_logprobs(ref_model, input_ids, attention_mask)
 
+    # ρ_t = π_θ(a_t|s_t) / π_θ_old(a_t|s_t) = exp(log π_θ − log π_θ_old)
+    # 当参数尚未更新时 ρ_t ≈ 1；随 PPO epoch 推进 ρ_t 开始偏离，clip 才真正生效
     ratio = torch.exp(logprobs - old_logprobs)
+
+    # advantages: (batch*G,) → (batch*G, 1) 以便与 per-token ratio (batch*G, T) 广播
     advantages = advantages.unsqueeze(1)
+
+    # L_clip(t) = min( ρ_t · A_i,   clip(ρ_t, 1−ε, 1+ε) · A_i )
+    # 当 A_i > 0（好于组均值）：若 ρ_t > 1+ε 则梯度截断，防止过度追加概率
+    # 当 A_i < 0（差于组均值）：若 ρ_t < 1−ε 则梯度截断，防止过度削减概率
     unclipped = ratio * advantages
     clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
     policy_objective = torch.minimum(unclipped, clipped)
 
-    # Non-negative per-token KL approximation used by several RLHF implementations.
+    # KL 散度 K3 近似：KL(π_θ ‖ π_ref) ≈ exp(Δ) − Δ − 1，Δ = log π_ref − log π_θ
+    # 性质：Δ=0 时值为 0；恒非负；是真实 KL 的下界；相比 log(π_ref/π_θ) 数值更稳定
     logp_diff = ref_logprobs - logprobs
     kl = torch.exp(logp_diff) - logp_diff - 1.0
 
+    # L = −E_t[ L_clip(t) − β · KL(t) ]，对补全 token 做归一化平均
+    # 负号：我们最小化损失，等价于最大化 clipped surrogate 并惩罚 KL 偏移
     per_token_loss = -(policy_objective - beta * kl)
     denom = completion_mask.sum().clamp_min(1)
     loss = (per_token_loss * completion_mask).sum() / denom
@@ -282,9 +379,13 @@ def sample_groups(
         completions.append(tokenizer.decode(completion_ids, skip_special_tokens=True))
 
     repeated_answers = repeat_by_group(answers, group_size)
+    # Step 2: 对每条补全打分，rewards shape: (batch * G,)
+    # 奖励函数：数值精确匹配 → 1.0，字符串包含匹配 → 1.0，否则 → 0.0
     rewards = reward_exact_match(completions, repeated_answers).to(device)
+    # Step 3: 组内 z-score 归一化，得到优势 A_i = (r_i − mean) / (std + ε)
     advantages = grpo_advantages(rewards, group_size).to(device)
-    # old_logprobs must be computed in eval mode with same dropout=0 as generation
+    # old_logprobs: rollout 时策略 π_θ_old 的 per-token 对数概率，用于后续计算 ρ_t
+    # 必须在 eval 模式下计算，确保 dropout 关闭，与 grpo_loss 中的 logprobs 对比有意义
     model.eval()
     try:
         old_logprobs = get_token_logprobs(model, generated, repeated_attention).detach()
